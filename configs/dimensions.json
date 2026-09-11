@@ -1,0 +1,9 @@
+{
+  "stance": "The user's degree of agreement or disagreement with the explicitly named target.",
+  "emotion": "The user's emotions, their intensity, and their target.",
+  "belief": "The user's underlying assumptions about people, relationships, or how the world works.",
+  "value": "What the user considers important or believes should be prioritized.",
+  "goal": "What the user is trying to accomplish with the response.",
+  "communication": "The tone and rhetorical structure used to communicate the response."
+}
+

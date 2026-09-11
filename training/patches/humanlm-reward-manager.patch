@@ -1,0 +1,133 @@
+diff --git a/humanlm/reward_function.py b/humanlm/reward_function.py
+index 0e1dbdc..f01fe4f 100644
+--- a/humanlm/reward_function.py
++++ b/humanlm/reward_function.py
+@@ -311,11 +311,15 @@ if "humanlm" not in REWARD_MANAGER_REGISTRY:
+             # Don't call super().__init__() yet - extract kwargs first
+             reward_kwargs = {}
+             if config is not None:
+-                rk = config.reward.get("reward_kwargs", {})
+-                if rk:
+-                    reward_kwargs = OmegaConf.to_container(rk, resolve=True) or {}
++                reward_cfg = config.get("reward_model", {}).get("reward_kwargs", {})
++                if not reward_cfg:
++                    reward_cfg = config.get("reward", {}).get("reward_kwargs", {})
++                if reward_cfg:
++                    reward_kwargs = OmegaConf.to_container(reward_cfg, resolve=True) or {}
+ 
+             self.n_rollouts = reward_kwargs.get("n_rollouts", 4)
++            self.response_reward_aggregation = reward_kwargs.get("response_reward_aggregation", "deco").lower()
++            self.pdn_epsilon = float(reward_kwargs.get("pdn_epsilon", 1e-6))
+             #key -> list w/ (data, future)
+             self._pending = defaultdict(list)  
+             self._lock = None 
+@@ -337,6 +341,12 @@ if "humanlm" not in REWARD_MANAGER_REGISTRY:
+             self.fetch_global_best_state = reward_kwargs.get("fetch_global_best_state", False)
+             self.eval_push_to_hub = reward_kwargs.get("eval_push_to_hub", None)
+             additional_generation_prompt = reward_kwargs.get("additional_generation_prompt", "")
++            if self.response_reward_aggregation not in {"deco", "pdn"}:
++                raise ValueError("response_reward_aggregation must be 'deco' or 'pdn'")
++            if self.response_reward_aggregation == "pdn" and self.n_rollouts < 2:
++                raise ValueError("PDN requires n_rollouts >= 2")
++            if self.pdn_epsilon <= 0:
++                raise ValueError("pdn_epsilon must be positive")
+             self.add_additional_generation_prompt = additional_generation_prompt != ""
+ 
+             state_config = reward_kwargs.get("state_config", None)
+@@ -390,10 +400,25 @@ if "humanlm" not in REWARD_MANAGER_REGISTRY:
+             assert 'index' in extra_info, "extra_info must contain 'index' for stable key"
+             return f"{global_step}:{extra_info['state_name']}:{extra_info['index']}"
+ 
++        @staticmethod
++        def _global_step(data: DataProto) -> int:
++            value = data.meta_info.get("global_steps") if hasattr(data, "meta_info") else None
++            if value is None and hasattr(data, "non_tensor_batch"):
++                value = data.non_tensor_batch.get("global_steps")
++            if value is None:
++                return 0
++            if hasattr(value, "numel"):
++                first = value.reshape(-1)[0]
++            elif isinstance(value, (list, tuple, np.ndarray)):
++                first = np.asarray(value).reshape(-1)[0]
++            else:
++                first = value
++            return int(first.item() if hasattr(first, "item") else first)
++
+         async def run_single(self, data: DataProto):
+             is_val = bool(data.non_tensor_batch["is_val"][0])
+             n = 1 if is_val else self.n_rollouts
+-            global_step = data.meta_info.get("global_steps", 0)
++            global_step = self._global_step(data)
+ 
+             key = self._stable_prompt_key(data.non_tensor_batch["extra_info"][0], global_step)
+             loop = asyncio.get_running_loop()
+@@ -433,11 +458,33 @@ if "humanlm" not in REWARD_MANAGER_REGISTRY:
+             datas = [item[0] for item in items]
+             futures = [item[1] for item in items]
+ 
+-            # Build a combined DataProto from all accumulated samples
+-            # Stack tensors along batch dimension
++            def pad_and_cat(name, tensors):
++                if len(tensors) == 1:
++                    return tensors[0]
++                target = [max(t.shape[d] for t in tensors) for d in range(tensors[0].dim())]
++                pad_token_id = self.tokenizer.pad_token_id
++                if pad_token_id is None:
++                    pad_token_id = self.tokenizer.eos_token_id or 0
++                fill = pad_token_id if name in {"prompts", "responses", "input_ids"} else 0
++                padded = []
++                for tensor in tensors:
++                    if list(tensor.shape[1:]) == target[1:]:
++                        padded.append(tensor)
++                        continue
++                    output = torch.full(
++                        (tensor.shape[0], *target[1:]),
++                        fill,
++                        dtype=tensor.dtype,
++                        device=tensor.device,
++                    )
++                    slices = (slice(None),) + tuple(slice(0, size) for size in tensor.shape[1:])
++                    output[slices] = tensor
++                    padded.append(output)
++                return torch.cat(padded, dim=0)
++
+             combined_batch = {}
+             for k in datas[0].batch.keys():
+-                combined_batch[k] = torch.cat([d.batch[k] for d in datas], dim=0)
++                combined_batch[k] = pad_and_cat(k, [d.batch[k] for d in datas])
+             
+             combined_non_tensor = {}
+             for k in datas[0].non_tensor_batch.keys():
+@@ -519,7 +566,7 @@ if "humanlm" not in REWARD_MANAGER_REGISTRY:
+                 ]
+             ground_truth = [item["ground_truth"] for item in data.non_tensor_batch["reward_model"]]
+ 
+-            global_step = data.meta_info.get("global_steps")
++            global_step = self._global_step(data)
+             keys = [self._stable_prompt_key(info, global_step) for info in extra_info]
+ 
+             state_names = [item["state_name"] for item in extra_info]
+@@ -764,6 +811,23 @@ if "humanlm" not in REWARD_MANAGER_REGISTRY:
+                     scores[i] = sample_score
+ 
+                 weighted_scores_by_fm = scores_by_fm
++                if (
++                    self.split == "train"
++                    and self.response_reward_aggregation == "pdn"
++                    and all(name == "response" for name in state_names)
++                ):
++                    normalized = {}
++                    for key, values in weighted_scores_by_fm.items():
++                        if values.numel() < 2:
++                            raise ValueError("PDN requires a complete rollout group")
++                        standard_deviation = values.std(unbiased=True)
++                        if torch.isfinite(standard_deviation) and standard_deviation.item() > 0:
++                            normalized[key] = (
++                                values - values.mean()
++                            ) / (standard_deviation + self.pdn_epsilon)
++                        else:
++                            normalized[key] = values
++                    weighted_scores_by_fm = normalized
+             else:
+                 scores_by_fm = {}
+                 try:

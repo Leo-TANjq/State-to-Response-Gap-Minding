@@ -1,0 +1,9 @@
+DECO-HumanLM
+Copyright 2026 Leo Tan
+
+The HumanLM integration patch and training metric are derived from HumanLM and
+verl code distributed under the Apache License 2.0. Their original copyright
+notices are retained. The pinned upstream source is:
+
+https://github.com/ehejin/verl-recipe-humanlm/tree/6a7dbd3f143fc0a9af599ed7a458fc503341f846/humanlm
+
