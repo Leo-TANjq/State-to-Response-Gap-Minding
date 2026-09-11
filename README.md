@@ -3,6 +3,14 @@
 Code for **Mind the State-to-Response Gap: Structured Reward Decomposition for Personalized
 User Simulation**.
 
+## Models
+
+- [0.6B DECO](https://huggingface.co/Leoputan/deco-humanlm-0.6b-deco)
+- [0.6B PDN](https://huggingface.co/Leoputan/deco-humanlm-0.6b-pdn)
+- [0.6B DECO-P](https://huggingface.co/Leoputan/deco-humanlm-0.6b-deco-p)
+- [8B DECO LoRA](https://huggingface.co/Leoputan/deco-humanlm-8b-deco-lora)
+- [8B PDN LoRA](https://huggingface.co/Leoputan/deco-humanlm-8b-pdn-lora)
+
 DECO scores a generated response on six user-state dimensions—stance, emotion, belief, value,
 goal, and communication—and aggregates them with equal weight. PDN standardizes each dimension
 within the rollout group before aggregation.
@@ -91,4 +99,3 @@ python scripts/install_humanlm_overlay.py /path/to/verl-recipe-humanlm --check
   year   = {2026}
 }
 ```
-
